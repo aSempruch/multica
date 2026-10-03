@@ -792,7 +792,7 @@ func (w *LocalWorktree) commitAll(logger *slog.Logger) (bool, error) {
 // commit" case and (false, err) for a real failure — the distinction callers
 // need to decide whether the tree is safe to discard.
 func commitEverything(worktreePath, message string, allowEmpty bool) (bool, error) {
-	if out, err := runGit(worktreePath, "add", "-A"); err != nil {
+	if out, err := retryGitEnv(worktreePath, nil, "add", "-A"); err != nil {
 		return false, fmt.Errorf("git add: %s: %w", strings.TrimSpace(out), err)
 	}
 	// --no-verify: the user's commit hooks are written for the user's own
@@ -805,7 +805,7 @@ func commitEverything(worktreePath, message string, allowEmpty bool) (bool, erro
 		args = append(args, "--allow-empty")
 	}
 	args = append(args, "-m", message)
-	if out, err := runGit(worktreePath, args...); err != nil {
+	if out, err := retryGitEnv(worktreePath, nil, args...); err != nil {
 		if strings.Contains(out, "nothing to commit") {
 			return false, nil
 		}
@@ -828,7 +828,7 @@ func commitIdentityArgs(dir string) []string {
 }
 
 func worktreeIsDirty(worktreePath string) (bool, error) {
-	out, err := runGit(worktreePath, "status", "--porcelain")
+	out, err := retryGitEnv(worktreePath, nil, "status", "--porcelain")
 	if err != nil {
 		return false, fmt.Errorf("git status: %s: %w", strings.TrimSpace(out), err)
 	}

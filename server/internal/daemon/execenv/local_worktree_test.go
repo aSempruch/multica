@@ -2196,3 +2196,77 @@ func TestAddLocalWorktreeRetriesTransientWorktreeAdd(t *testing.T) {
 		t.Fatalf("the retried add did not create the worktree: %v", err)
 	}
 }
+
+// TestCommitEverythingRetriesTransientCommit drives the baseline-commit
+// failure mode: the commit cannot reread a blob it just staged for a moment,
+// and the retry lands the commit.
+func TestCommitEverythingRetriesTransientCommit(t *testing.T) {
+	prev := transientGitDelay
+	t.Cleanup(func() { transientGitDelay = prev })
+	transientGitDelay = 0
+
+	repo := newTestRepo(t)
+
+	base := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolved
+	}
+	worktree := filepath.Join(base, "wt")
+	gitRun(t, repo, "worktree", "add", "--detach", worktree)
+
+	if err := os.WriteFile(filepath.Join(worktree, "wip.txt"), []byte("wip\n"), 0o644); err != nil {
+		t.Fatalf("write an uncommitted edit: %v", err)
+	}
+	state := installFakeGit(t, worktree, "commit",
+		"error: unable to open loose object 9a98ba512e521a968d127892f7b8b71f6f2e3841: Permission denied\n"+
+			"error: invalid object 100644 9a98ba512e521a968d127892f7b8b71f6f2e3841 for 'src/test/resources/sample-acord.tiff'\n"+
+			"error: Error building trees: exit status 1\n")
+
+	const message = "chore(agent): baseline — the task worktree started here"
+	committed, err := commitEverything(worktree, message, false)
+	if err != nil {
+		t.Fatalf("commitEverything should have recovered from the transient commit failure: %v", err)
+	}
+	if !committed {
+		t.Fatalf("committed = false, want true")
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the injected failure never fired (state file still present; err = %v)", err)
+	}
+	if tip := gitRun(t, worktree, "log", "-1", "--format=%s"); tip != message {
+		t.Errorf("the retried commit left %q at the tip, want %q", tip, message)
+	}
+}
+
+// TestWorktreeIsDirtyRetriesTransientStatus drives the dirty-check failure
+// mode: status cannot read the branch tip's tree for a moment, and the retry
+// answers from the same worktree.
+func TestWorktreeIsDirtyRetriesTransientStatus(t *testing.T) {
+	prev := transientGitDelay
+	t.Cleanup(func() { transientGitDelay = prev })
+	transientGitDelay = 0
+
+	repo := newTestRepo(t)
+
+	base := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolved
+	}
+	worktree := filepath.Join(base, "wt")
+	gitRun(t, repo, "worktree", "add", "--detach", worktree)
+
+	state := installFakeGit(t, worktree, "status",
+		"error: unable to open loose object bc9f3cacf92675001ba20230c64ee7d6321ec04d: Permission denied\n"+
+			"fatal: unable to read tree (bc9f3cacf92675001ba20230c64ee7d6321ec04d): exit status 128\n")
+
+	dirty, err := worktreeIsDirty(worktree)
+	if err != nil {
+		t.Fatalf("worktreeIsDirty should have recovered from the transient status failure: %v", err)
+	}
+	if dirty {
+		t.Errorf("dirty = true, want false for a fresh worktree")
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the injected failure never fired (state file still present; err = %v)", err)
+	}
+}

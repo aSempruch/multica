@@ -1758,17 +1758,21 @@ func withGitStderr(err error) error {
 	return err
 }
 
-// transientGitAttempts bounds how many times a snapshot or replay step re-asks
-// the object store for a byte it momentarily refused. The failure this covers
-// is a loose object unreadable for a few milliseconds on a shared-filesystem
-// mount (virtiofs), which lasts far less than the total wait; a real problem
-// reproduces on every attempt and fails closed after the last one, with the
-// same error text as before this retry existed.
-const transientGitAttempts = 3
+// transientGitAttempts bounds how many times a git step re-asks the object
+// store for a byte it momentarily refused. With the doubling pause below the
+// default settings span ~15s: the virtiofs read storms observed in the field
+// outlast a 1s window, while a genuinely broken store still fails the task in
+// bounded time with the same error text as before this retry existed.
+const transientGitAttempts = 6
 
-// transientGitDelay is the pause between attempts. A var so tests run without
-// sleeping.
+// transientGitDelay is the pause before the second attempt; each following
+// pause doubles, spreading the attempts over the window. A var so tests run
+// without sleeping.
 var transientGitDelay = 500 * time.Millisecond
+
+// transientGitSleep is time.Sleep, behind a var so tests can assert the
+// backoff without waiting.
+var transientGitSleep = time.Sleep
 
 // transientObjectRead reports whether git's failure output describes the
 // object store failing to serve a byte rather than the operation itself being
@@ -1793,24 +1797,38 @@ func transientObjectRead(out string) bool {
 }
 
 // retryTransientGit re-runs a git command while it fails with a transient
-// object-read signature, pausing transientGitDelay between attempts. It is
-// for the snapshot and replay steps, which read from and write to the
-// user's shared object database. reset runs before each retry for commands
-// that can leave state behind — a cherry-pick that died mid-merge — and is
-// nil for stateless ones. The returned error is the last attempt's, so
-// callers keep the error text they see today.
+// object-read signature. It pauses transientGitDelay before the second
+// attempt and doubles the pause before each later one, so a shared object
+// store that is stuck for several seconds gets a chance to recover. reset
+// runs before each retry for commands that can leave state behind (a
+// cherry-pick that died mid-merge) and is nil for stateless ones.
+//
+// The returned error is the last attempt's, so callers keep the error text
+// they see today. When a transient failure outlasts the whole window the
+// error is annotated with the attempt count: prepare runs in a killable
+// helper process whose stderr the parent discards, so the error text is the
+// only channel that reaches the task log, and the annotation is what tells
+// the operator the retry fired and the window was not long enough.
 func retryTransientGit(run func() (string, error), reset func()) (string, error) {
 	var out string
 	var err error
 	for attempt := 1; ; attempt++ {
 		out, err = run()
-		if err == nil || !transientObjectRead(out) || attempt == transientGitAttempts {
+		if err == nil {
+			return out, nil
+		}
+		if !transientObjectRead(out) {
+			// A genuine failure, not the object store: retrying cannot help.
 			return out, err
+		}
+		if attempt == transientGitAttempts {
+			return out, fmt.Errorf("%w: transient object-read failure persisted after %d attempts",
+				err, transientGitAttempts)
 		}
 		if reset != nil {
 			reset()
 		}
-		time.Sleep(transientGitDelay)
+		transientGitSleep(transientGitDelay << uint(attempt-1))
 	}
 }
 

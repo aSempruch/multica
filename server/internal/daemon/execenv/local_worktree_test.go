@@ -2012,6 +2012,73 @@ func TestRetryTransientGit(t *testing.T) {
 		}
 	})
 
+	t.Run("recovers when the glitch outlasts the first attempts", func(t *testing.T) {
+		calls := 0
+		out, err := retryTransientGit(func() (string, error) {
+			calls++
+			if calls <= 3 {
+				return transient, fmt.Errorf("exit status 128")
+			}
+			return "value", nil
+		}, nil)
+		if err != nil {
+			t.Fatalf("err = %v, want none: the window must outlast a multi-attempt glitch", err)
+		}
+		if out != "value" {
+			t.Errorf("out = %q, want %q", out, "value")
+		}
+		if calls != 4 {
+			t.Errorf("calls = %d, want 4", calls)
+		}
+	})
+
+	t.Run("doubles the pause before each later attempt", func(t *testing.T) {
+		prevDelay := transientGitDelay
+		t.Cleanup(func() { transientGitDelay = prevDelay })
+		transientGitDelay = time.Millisecond
+
+		prevSleep := transientGitSleep
+		var pauses []time.Duration
+		t.Cleanup(func() { transientGitSleep = prevSleep })
+		transientGitSleep = func(d time.Duration) { pauses = append(pauses, d) }
+
+		_, err := retryTransientGit(func() (string, error) {
+			return transient, fmt.Errorf("exit status 128")
+		}, nil)
+		if err == nil {
+			t.Fatal("want an error, got none")
+		}
+		want := []time.Duration{
+			time.Millisecond,
+			2 * time.Millisecond,
+			4 * time.Millisecond,
+			8 * time.Millisecond,
+			16 * time.Millisecond,
+		}
+		if len(pauses) != len(want) {
+			t.Fatalf("pauses = %v, want %v (%d attempts means %d pauses)",
+				pauses, want, transientGitAttempts, len(want))
+		}
+		for i := range want {
+			if pauses[i] != want[i] {
+				t.Errorf("pause %d = %v, want %v", i+1, pauses[i], want[i])
+			}
+		}
+	})
+
+	t.Run("annotates the exhausted error with the attempt count", func(t *testing.T) {
+		_, err := retryTransientGit(func() (string, error) {
+			return transient, fmt.Errorf("exit status 128")
+		}, nil)
+		if err == nil {
+			t.Fatal("want an error, got none")
+		}
+		want := fmt.Sprintf("persisted after %d attempts", transientGitAttempts)
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %q, want it to contain %q", err, want)
+		}
+	})
+
 	t.Run("does not retry a non-transient failure", func(t *testing.T) {
 		calls, resets := 0, 0
 		_, err := retryTransientGit(func() (string, error) {

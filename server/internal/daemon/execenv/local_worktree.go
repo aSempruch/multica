@@ -379,7 +379,7 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	}
 
 	plan := resolveTaskBranch(gitRoot, params, headSHA, logger)
-	actualBranch, createdBranch, err := addLocalWorktree(gitRoot, worktreePath, plan, params.TaskID)
+	actualBranch, createdBranch, err := addLocalWorktree(gitRoot, worktreePath, plan, params.TaskID, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -1280,7 +1280,7 @@ func branchOwnedBy(gitRoot, branch string, owner branchOwner, logger *slog.Logge
 // git allows one worktree per branch, and refusing to run is worse than
 // delivering onto a task-scoped branch. It forks from the same base, so the
 // sibling still stands on the conversation's latest work.
-func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID string) (string, bool, error) {
+func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID string, logger *slog.Logger) (string, bool, error) {
 	var args []string
 	switch {
 	case plan.continues:
@@ -1292,7 +1292,14 @@ func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID 
 	default:
 		args = []string{"worktree", "add", "-b", plan.name, worktreePath, plan.base}
 	}
-	out, err := runGit(gitRoot, args...)
+	// Only the creating variants can leave a half-made ref behind; the others
+	// attach to or move an existing branch, which a retry simply repeats.
+	createsBranch := !plan.continues && !plan.reset
+	out, err := retryTransientGit(func() (string, error) {
+		return runGit(gitRoot, args...)
+	}, func() {
+		resetWorktreeAdd(gitRoot, worktreePath, plan.name, createsBranch, logger)
+	})
 	if err == nil {
 		return plan.name, !plan.continues, nil
 	}
@@ -1300,7 +1307,12 @@ func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID 
 		return "", false, fmt.Errorf("execenv: git worktree add: %s: %w", strings.TrimSpace(out), err)
 	}
 	alt := plan.altName(taskID)
-	if out, err := runGit(gitRoot, "worktree", "add", "-b", alt, worktreePath, plan.base); err != nil {
+	out, err = retryTransientGit(func() (string, error) {
+		return runGit(gitRoot, "worktree", "add", "-b", alt, worktreePath, plan.base)
+	}, func() {
+		resetWorktreeAdd(gitRoot, worktreePath, alt, true, logger)
+	})
+	if err != nil {
 		return "", false, fmt.Errorf("execenv: git worktree add: %s: %w", strings.TrimSpace(out), err)
 	}
 	return alt, true, nil
@@ -1820,4 +1832,25 @@ func retryGitTrimmed(dir string, args ...string) (string, error) {
 		return "", fmt.Errorf("%s: %w", strings.TrimSpace(out), err)
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// resetWorktreeAdd undoes what a failed `worktree add` may have left behind so
+// the retry starts where the first attempt did: a partially checked-out
+// worktree and, when the variant creates the branch, the ref the checkout died
+// after making. A ref named branch can only be ours here: git runs its
+// branch-exists check before it reads the tree, so a ref that survives a
+// transient object failure is the one our own attempt made, still at base.
+//
+// Best effort by design: whatever it cannot clear, the retried add reports as
+// a plain non-transient failure.
+func resetWorktreeAdd(gitRoot, worktreePath, branch string, createsBranch bool, logger *slog.Logger) {
+	if err := removeLocalWorktreeDir(gitRoot, worktreePath, logger); err != nil {
+		if logger != nil {
+			logger.Warn("execenv: could not clear the worktree path after a failed add; the retry will report it",
+				"path", worktreePath, "error", err)
+		}
+	}
+	if createsBranch {
+		runGit(gitRoot, "branch", "-D", branch)
+	}
 }

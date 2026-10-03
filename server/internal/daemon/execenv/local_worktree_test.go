@@ -2158,3 +2158,41 @@ func TestReplayUserStateRetriesTransientCherryPick(t *testing.T) {
 		t.Errorf("the retried replay left local-edit.txt as %q", got)
 	}
 }
+
+// TestAddLocalWorktreeRetriesTransientWorktreeAdd drives the worktree-add
+// failure mode: the add cannot read the base tree for a moment, the half-made
+// worktree and ref are cleared, and the retry creates the branch.
+func TestAddLocalWorktreeRetriesTransientWorktreeAdd(t *testing.T) {
+	prev := transientGitDelay
+	t.Cleanup(func() { transientGitDelay = prev })
+	transientGitDelay = 0
+
+	repo := newTestRepo(t)
+	head := gitRun(t, repo, "rev-parse", "HEAD")
+
+	base := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolved
+	}
+	worktree := filepath.Join(base, "wt")
+
+	state := installFakeGit(t, repo, "worktree",
+		"Preparing worktree (new branch 'agent/j/local')\n"+
+			"error: unable to open loose object 0004cba1f8a0bb9170d043fde7fc9761491714b8: Permission denied\n"+
+			"fatal: unable to read tree (0004cba1f8a0bb9170d043fde7fc9761491714b8): exit status 128\n")
+
+	plan := taskBranchPlan{name: "agent/j/local", base: head}
+	branch, created, err := addLocalWorktree(repo, worktree, plan, "task-1", worktreeTestLogger())
+	if err != nil {
+		t.Fatalf("addLocalWorktree should have recovered from the transient worktree add failure: %v", err)
+	}
+	if branch != plan.name || !created {
+		t.Fatalf("branch = %q (created = %v), want %q (created = true)", branch, created, plan.name)
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the injected failure never fired (state file still present; err = %v)", err)
+	}
+	if _, err := os.Stat(worktree); err != nil {
+		t.Fatalf("the retried add did not create the worktree: %v", err)
+	}
+}

@@ -941,7 +941,7 @@ func captureUserSnapshot(gitRoot, envRoot, headSHA string, logger *slog.Logger) 
 	// so the fallback runs on any error from the add, not just from the copy.
 	seeded := seedSnapshotIndex(gitRoot, indexPath)
 	addArgs := append([]string{"add", "-A", "--"}, snapshotExcludes()...)
-	if out, err := runGitEnv(gitRoot, env, addArgs...); err != nil {
+	if out, err := retryGitEnv(gitRoot, env, addArgs...); err != nil {
 		if !seeded {
 			return "", fmt.Errorf("git add: %s: %w", strings.TrimSpace(out), err)
 		}
@@ -949,23 +949,24 @@ func captureUserSnapshot(gitRoot, envRoot, headSHA string, logger *slog.Logger) 
 			logger.Debug("execenv: snapshot index seeded from the repository index was unusable; rebuilding it",
 				"git_root", gitRoot, "output", strings.TrimSpace(out), "error", err)
 		}
-		if out, resetErr := runGitEnv(gitRoot, env, "read-tree", headSHA); resetErr != nil {
+		if out, resetErr := retryGitEnv(gitRoot, env, "read-tree", headSHA); resetErr != nil {
 			return "", fmt.Errorf("git read-tree: %s: %w", strings.TrimSpace(out), resetErr)
 		}
-		if out, retryErr := runGitEnv(gitRoot, env, addArgs...); retryErr != nil {
+		if out, retryErr := retryGitEnv(gitRoot, env, addArgs...); retryErr != nil {
 			return "", fmt.Errorf("git add: %s: %w", strings.TrimSpace(out), retryErr)
 		}
 	}
-	tree, err := runGitTrimmedEnv(gitRoot, env, "write-tree")
+	out, err := retryGitEnv(gitRoot, env, "write-tree")
 	if err != nil {
-		return "", fmt.Errorf("git write-tree: %w", err)
+		return "", fmt.Errorf("git write-tree: %s: %w", strings.TrimSpace(out), err)
 	}
+	tree := strings.TrimSpace(out)
 	// The identity args cover a repo with no user.email configured: writing a
 	// commit object needs a committer, and without them the user's uncommitted
 	// work would be dropped on a technicality.
 	args := append(commitIdentityArgs(gitRoot), "commit-tree", tree, "-p", headSHA, "-m",
 		"multica: local directory snapshot\n\nThe tree of this commit is the user's working directory as a task saw it.")
-	snapshot, err := runGitTrimmed(gitRoot, args...)
+	snapshot, err := retryGitTrimmed(gitRoot, args...)
 	if err != nil {
 		return "", fmt.Errorf("git commit-tree: %w", err)
 	}
@@ -1362,12 +1363,19 @@ func replayUserState(worktreePath string, plan taskBranchPlan, snapshot string, 
 	// the entire point: it is not reachable any other way.
 	args := append(commitIdentityArgs(worktreePath), "commit-tree", snapshot+"^{tree}", "-p", carried,
 		"-m", "multica: local directory edits to replay")
-	increment, err := runGitTrimmed(worktreePath, args...)
+	increment, err := retryGitTrimmed(worktreePath, args...)
 	if err != nil || increment == "" {
 		return replayResult{}, fmt.Errorf("execenv: could not describe your local edits for replay into the task worktree: %w", err)
 	}
 
-	out, pickErr := runGit(worktreePath, "cherry-pick", "--no-commit", increment)
+	out, pickErr := retryTransientGit(func() (string, error) {
+		return runGit(worktreePath, "cherry-pick", "--no-commit", increment)
+	}, func() {
+		// A pick that died mid-merge can leave sequencer state or a
+		// half-applied tree; restore the branch tip so the retry starts
+		// from the same point as the first attempt.
+		abortCherryPick(worktreePath, logger)
+	})
 	if pickErr == nil {
 		return replayResult{}, nil
 	}
@@ -1471,8 +1479,9 @@ func unmergedPaths(worktreePath string) ([]string, error) {
 	return paths, nil
 }
 
-// abortCherryPick returns the worktree to the branch tip. Used only where the
-// conflict is not something the agent can act on; the ordinary conflict path
+// abortCherryPick returns the worktree to the branch tip. Used where the
+// cherry-pick must not be left behind — a failure the agent cannot act on, or
+// a transient failure about to be retried — while the ordinary conflict path
 // deliberately leaves the worktree as git left it.
 func abortCherryPick(worktreePath string, logger *slog.Logger) {
 	for _, args := range [][]string{{"cherry-pick", "--quit"}, {"reset", "--hard", "HEAD"}, {"clean", "-fdq"}} {
@@ -1735,4 +1744,80 @@ func withGitStderr(err error) error {
 		}
 	}
 	return err
+}
+
+// transientGitAttempts bounds how many times a snapshot or replay step re-asks
+// the object store for a byte it momentarily refused. The failure this covers
+// is a loose object unreadable for a few milliseconds on a shared-filesystem
+// mount (virtiofs), which lasts far less than the total wait; a real problem
+// reproduces on every attempt and fails closed after the last one, with the
+// same error text as before this retry existed.
+const transientGitAttempts = 3
+
+// transientGitDelay is the pause between attempts. A var so tests run without
+// sleeping.
+var transientGitDelay = 500 * time.Millisecond
+
+// transientObjectRead reports whether git's failure output describes the
+// object store failing to serve a byte rather than the operation itself being
+// wrong: a loose object momentarily unreadable, a blob not yet visible after
+// being written, an I/O error. The same command succeeds on the next attempt.
+// A genuine error — a conflict, a bad ref, real corruption — never matches
+// and is returned after the first attempt.
+func transientObjectRead(out string) bool {
+	lower := strings.ToLower(out)
+	for _, marker := range []string{
+		"unable to open loose object",
+		"unable to read",
+		"permission denied",
+		"input/output error",
+		"invalid object",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryTransientGit re-runs a git command while it fails with a transient
+// object-read signature, pausing transientGitDelay between attempts. It is
+// for the snapshot and replay steps, which read from and write to the
+// user's shared object database. reset runs before each retry for commands
+// that can leave state behind — a cherry-pick that died mid-merge — and is
+// nil for stateless ones. The returned error is the last attempt's, so
+// callers keep the error text they see today.
+func retryTransientGit(run func() (string, error), reset func()) (string, error) {
+	var out string
+	var err error
+	for attempt := 1; ; attempt++ {
+		out, err = run()
+		if err == nil || !transientObjectRead(out) || attempt == transientGitAttempts {
+			return out, err
+		}
+		if reset != nil {
+			reset()
+		}
+		time.Sleep(transientGitDelay)
+	}
+}
+
+// retryGitEnv is runGitEnv with the transient retry, for the snapshot steps
+// that run against a private index.
+func retryGitEnv(dir string, extraEnv []string, args ...string) (string, error) {
+	return retryTransientGit(func() (string, error) {
+		return runGitEnv(dir, extraEnv, args...)
+	}, nil)
+}
+
+// retryGitTrimmed is runGitTrimmed with the transient retry. Like
+// runGitTrimmedEnv it folds git's failure output into the error, because on
+// this path stderr is not on the error at all — it is inside the combined
+// output.
+func retryGitTrimmed(dir string, args ...string) (string, error) {
+	out, err := retryGitEnv(dir, nil, args...)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", strings.TrimSpace(out), err)
+	}
+	return strings.TrimSpace(out), nil
 }

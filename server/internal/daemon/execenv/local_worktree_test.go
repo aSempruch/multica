@@ -1912,3 +1912,249 @@ func TestIsolatedPrepareKeepsTheReadOnlyBranchDrop(t *testing.T) {
 		t.Error("a turn that changed nothing left its branch behind")
 	}
 }
+
+func TestTransientObjectRead(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{
+			name: "loose object unreadable on a shared mount",
+			out:  "error: unable to open loose object bc9f3cacf92675001ba20230c64ee7d6321ec04d: Permission denied\nfatal: unable to read tree (bc9f3cacf92675001ba20230c64ee7d6321ec04d): exit status 128",
+			want: true,
+		},
+		{
+			name: "write-tree rereading a just-written blob",
+			out:  "error: invalid object 100644 9df2e69c092c2eb02d08f797497a2c4955abed0c for 'local-edit.txt'\nfatal: git-write-tree: error building trees: exit status 128",
+			want: true,
+		},
+		{
+			name: "unable to read blob",
+			out:  "fatal: unable to read blob 4b825dc642cb6eb9a060e54bf8d69288fbee4904: exit status 128",
+			want: true,
+		},
+		{
+			name: "indexing a file hits an i/o error",
+			out:  "error: unable to index file 'a.txt': Input/output error",
+			want: true,
+		},
+		{
+			name: "a merge conflict is not transient",
+			out:  "Auto-merging a.txt\nCONFLICT (content): Merge conflict in a.txt\nerror: could not apply 1234567... replay",
+			want: false,
+		},
+		{
+			name: "a bad revision is not transient",
+			out:  "fatal: bad revision 'refs/multica/local-state/b'",
+			want: false,
+		},
+		{
+			name: "not a repository is not transient",
+			out:  "fatal: not a git repository (or any of the parent directories): .git",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := transientObjectRead(tc.out); got != tc.want {
+				t.Errorf("transientObjectRead = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRetryTransientGit(t *testing.T) {
+	prev := transientGitDelay
+	t.Cleanup(func() { transientGitDelay = prev })
+	transientGitDelay = 0
+
+	const transient = "fatal: unable to read tree (abc123): exit status 128"
+	const nonTransient = "fatal: bad revision 'nope'"
+
+	t.Run("recovers when the next attempt succeeds", func(t *testing.T) {
+		calls, resets := 0, 0
+		out, err := retryTransientGit(func() (string, error) {
+			calls++
+			if calls == 1 {
+				return transient, fmt.Errorf("exit status 128")
+			}
+			return "value", nil
+		}, func() { resets++ })
+		if err != nil {
+			t.Fatalf("err = %v, want none", err)
+		}
+		if out != "value" {
+			t.Errorf("out = %q, want %q", out, "value")
+		}
+		if calls != 2 || resets != 1 {
+			t.Errorf("calls = %d, resets = %d, want 2 and 1", calls, resets)
+		}
+	})
+
+	t.Run("fails closed after the bounded attempts", func(t *testing.T) {
+		calls, resets := 0, 0
+		out, err := retryTransientGit(func() (string, error) {
+			calls++
+			return transient, fmt.Errorf("exit status 128")
+		}, func() { resets++ })
+		if err == nil {
+			t.Fatal("want an error, got none")
+		}
+		if out != transient {
+			t.Errorf("out = %q, want the last attempt's output", out)
+		}
+		if calls != transientGitAttempts {
+			t.Errorf("calls = %d, want %d", calls, transientGitAttempts)
+		}
+		if resets != transientGitAttempts-1 {
+			t.Errorf("resets = %d, want %d", resets, transientGitAttempts-1)
+		}
+	})
+
+	t.Run("does not retry a non-transient failure", func(t *testing.T) {
+		calls, resets := 0, 0
+		_, err := retryTransientGit(func() (string, error) {
+			calls++
+			return nonTransient, fmt.Errorf("exit status 128")
+		}, func() { resets++ })
+		if err == nil {
+			t.Fatal("want an error, got none")
+		}
+		if calls != 1 || resets != 0 {
+			t.Errorf("calls = %d, resets = %d, want 1 and 0", calls, resets)
+		}
+	})
+
+	t.Run("does not run the reset on a first-attempt success", func(t *testing.T) {
+		resets := 0
+		_, err := retryTransientGit(func() (string, error) {
+			return "ok", nil
+		}, func() { resets++ })
+		if err != nil {
+			t.Fatalf("err = %v, want none", err)
+		}
+		if resets != 0 {
+			t.Errorf("resets = %d, want 0", resets)
+		}
+	})
+}
+
+// installFakeGit puts a git wrapper first on PATH: for invocations whose -C
+// directory is exactly dir, it fails cmd once with signature and delegates
+// every other invocation to the real git. Gating on the exact directory keeps
+// the injection away from this package's other, parallel tests. It returns
+// the state file whose disappearance proves the injection fired.
+func installFakeGit(t *testing.T, dir, cmd, signature string) string {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("locate the real git: %v", err)
+	}
+	bin := t.TempDir()
+	script := fmt.Sprintf(`#!/bin/sh
+gdir="$2"
+gcmd="$3"
+case "$gdir" in
+	"%s"|"%s"/*)
+		if [ "$gcmd" = "%s" ] && [ -f "$MULTICA_TEST_FAKE_GIT_STATE" ]; then
+			rm -f "$MULTICA_TEST_FAKE_GIT_STATE"
+			cat "$MULTICA_TEST_FAKE_GIT_MSG" >&2
+			exit 128
+		fi
+		;;
+esac
+exec "%s" "$@"
+`, dir, dir, cmd, realGit)
+	wrapper := filepath.Join(bin, "git")
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatalf("write the git wrapper: %v", err)
+	}
+	state := filepath.Join(bin, "fail-once")
+	if err := os.WriteFile(state, nil, 0o600); err != nil {
+		t.Fatalf("create the state file: %v", err)
+	}
+	msg := filepath.Join(bin, "signature")
+	if err := os.WriteFile(msg, []byte(signature), 0o600); err != nil {
+		t.Fatalf("write the signature: %v", err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MULTICA_TEST_FAKE_GIT_STATE", state)
+	t.Setenv("MULTICA_TEST_FAKE_GIT_MSG", msg)
+	return state
+}
+
+// TestCaptureUserSnapshotRetriesTransientWriteTree drives the write-tree
+// failure mode: git add wrote the blobs, write-tree cannot reread one of them
+// for a moment, and the capture recovers on the retry.
+func TestCaptureUserSnapshotRetriesTransientWriteTree(t *testing.T) {
+	prev := transientGitDelay
+	t.Cleanup(func() { transientGitDelay = prev })
+	transientGitDelay = 0
+
+	repo := newTestRepo(t)
+	head := gitRun(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "local-edit.txt"), []byte("an uncommitted edit\n"), 0o644); err != nil {
+		t.Fatalf("write an uncommitted edit: %v", err)
+	}
+	state := installFakeGit(t, repo, "write-tree",
+		"error: invalid object 100644 9df2e69c092c2eb02d08f797497a2c4955abed0c for 'local-edit.txt'\n"+
+			"fatal: git-write-tree: error building trees: exit status 128\n")
+
+	snapshot, err := captureUserSnapshot(repo, t.TempDir(), head, worktreeTestLogger())
+	if err != nil {
+		t.Fatalf("captureUserSnapshot should have recovered from the transient write-tree failure: %v", err)
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the injected failure never fired (state file still present; err = %v)", err)
+	}
+	tree := gitRun(t, repo, "ls-tree", snapshot)
+	if !strings.Contains(tree, "local-edit.txt") {
+		t.Errorf("the recovered snapshot does not carry the uncommitted edit:\n%s", tree)
+	}
+}
+
+// TestReplayUserStateRetriesTransientCherryPick drives the cherry-pick
+// failure mode: the replay cannot read the snapshot's tree for a moment, the
+// worktree is restored to the branch tip, and the retry lands the edit.
+func TestReplayUserStateRetriesTransientCherryPick(t *testing.T) {
+	prev := transientGitDelay
+	t.Cleanup(func() { transientGitDelay = prev })
+	transientGitDelay = 0
+
+	repo := newTestRepo(t)
+	head := gitRun(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "local-edit.txt"), []byte("an uncommitted edit\n"), 0o644); err != nil {
+		t.Fatalf("write an uncommitted edit: %v", err)
+	}
+	snapshot, err := captureUserSnapshot(repo, t.TempDir(), head, worktreeTestLogger())
+	if err != nil {
+		t.Fatalf("captureUserSnapshot: %v", err)
+	}
+
+	base := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolved
+	}
+	worktree := filepath.Join(base, "wt")
+	gitRun(t, repo, "worktree", "add", "--detach", worktree, head)
+
+	state := installFakeGit(t, worktree, "cherry-pick",
+		"error: unable to open loose object bc9f3cacf92675001ba20230c64ee7d6321ec04d: Permission denied\n"+
+			"fatal: unable to read tree (bc9f3cacf92675001ba20230c64ee7d6321ec04d): exit status 128\n")
+
+	plan := taskBranchPlan{name: "agent/j/local", base: head}
+	res, err := replayUserState(worktree, plan, snapshot, worktreeTestLogger())
+	if err != nil {
+		t.Fatalf("replayUserState should have recovered from the transient cherry-pick failure: %v", err)
+	}
+	if len(res.conflicts) != 0 {
+		t.Errorf("replay reported conflicts %v, want none", res.conflicts)
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the injected failure never fired (state file still present; err = %v)", err)
+	}
+	if got := readFile(t, filepath.Join(worktree, "local-edit.txt")); got != "an uncommitted edit\n" {
+		t.Errorf("the retried replay left local-edit.txt as %q", got)
+	}
+}

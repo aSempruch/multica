@@ -125,3 +125,13 @@ Workspace-scoped queries filter by `workspace_id`; membership gates access and `
 - Do not add internal compatibility shims, dual writes, fallback paths, or legacy adapters unless requested. This does not relax API response compatibility above.
 - New global pre-workspace routes use a single word or `/{noun}/{verb}`, not hyphenated root names. Update `server/internal/handler/reserved_slugs.json`, run `pnpm generate:reserved-slugs`, and commit `packages/core/paths/reserved-slugs.ts` when changing reserved slugs.
 - Use atomic conventional commits and the repository PR template. For releases, follow [.github/RELEASING.md](.github/RELEASING.md); default to a patch bump unless specified otherwise.
+
+## Security Review
+
+Code in this repo runs on company laptops. Before relying on new code here (own or upstream), scan the diff for data exfiltration:
+
+- No new external endpoints: grep added lines for URLs and confirm every new literal is a test fixture or resolves to the deployment's own host.
+- No new network paths: no new `http.Client`/`fetch`/WebSocket destinations and no telemetry or analytics SDK wiring beyond the existing `server/internal/analytics` seam.
+- No dynamic downloads or code execution: added `exec.Command` calls must be documented local operations (agent CLI launches, tests), never fetched content.
+- New env vars and flags must not point at external hosts; CLI and client changes may only talk to the configured deployment.
+- Report which layers were reviewed (CLI/daemon/desktop vs server-side) so server-only integrations are not conflated with laptop-client behavior, and state confidence: diff-level review is not execution.

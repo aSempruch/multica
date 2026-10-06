@@ -20,6 +20,7 @@ Multica is a task management platform where people and agents collaborate on iss
 | `apps/desktop/` | Electron and desktop-only UI/state. Application navigation goes through `apps/desktop/src/renderer/src/platform/`. |
 | `apps/mobile/` | Independent Expo/React Native client: owns UI, state, hooks, providers, i18n, build, and release. Shares core types and pure utilities, including platform-independent schemas. |
 | `apps/docs/` | Fumadocs documentation site |
+| `sidecars/` | Standalone personal tooling that runs beside an install (pollers, bridges). Not built or tested by root commands; uses the `multica` CLI or public API, never the database. See [sidecars/README.md](sidecars/README.md). |
 
 - Dependency direction is `views -> core + ui`; core and ui remain independent. Shared packages export raw TypeScript compiled by consuming apps.
 - Extract logic used by both web and desktop into the appropriate shared package. Keep framework/Electron APIs in the app layer; inject platform-specific UI through props/slots.

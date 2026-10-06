@@ -379,7 +379,7 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	}
 
 	plan := resolveTaskBranch(gitRoot, params, headSHA, logger)
-	actualBranch, createdBranch, err := addLocalWorktree(gitRoot, worktreePath, plan, params.TaskID)
+	actualBranch, createdBranch, err := addLocalWorktree(gitRoot, worktreePath, plan, params.TaskID, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -792,7 +792,7 @@ func (w *LocalWorktree) commitAll(logger *slog.Logger) (bool, error) {
 // commit" case and (false, err) for a real failure — the distinction callers
 // need to decide whether the tree is safe to discard.
 func commitEverything(worktreePath, message string, allowEmpty bool) (bool, error) {
-	if out, err := runGit(worktreePath, "add", "-A"); err != nil {
+	if out, err := retryGitEnv(worktreePath, nil, "add", "-A"); err != nil {
 		return false, fmt.Errorf("git add: %s: %w", strings.TrimSpace(out), err)
 	}
 	// --no-verify: the user's commit hooks are written for the user's own
@@ -805,7 +805,7 @@ func commitEverything(worktreePath, message string, allowEmpty bool) (bool, erro
 		args = append(args, "--allow-empty")
 	}
 	args = append(args, "-m", message)
-	if out, err := runGit(worktreePath, args...); err != nil {
+	if out, err := retryGitEnv(worktreePath, nil, args...); err != nil {
 		if strings.Contains(out, "nothing to commit") {
 			return false, nil
 		}
@@ -828,7 +828,7 @@ func commitIdentityArgs(dir string) []string {
 }
 
 func worktreeIsDirty(worktreePath string) (bool, error) {
-	out, err := runGit(worktreePath, "status", "--porcelain")
+	out, err := retryGitEnv(worktreePath, nil, "status", "--porcelain")
 	if err != nil {
 		return false, fmt.Errorf("git status: %s: %w", strings.TrimSpace(out), err)
 	}
@@ -941,7 +941,7 @@ func captureUserSnapshot(gitRoot, envRoot, headSHA string, logger *slog.Logger) 
 	// so the fallback runs on any error from the add, not just from the copy.
 	seeded := seedSnapshotIndex(gitRoot, indexPath)
 	addArgs := append([]string{"add", "-A", "--"}, snapshotExcludes()...)
-	if out, err := runGitEnv(gitRoot, env, addArgs...); err != nil {
+	if out, err := retryGitEnv(gitRoot, env, addArgs...); err != nil {
 		if !seeded {
 			return "", fmt.Errorf("git add: %s: %w", strings.TrimSpace(out), err)
 		}
@@ -949,23 +949,24 @@ func captureUserSnapshot(gitRoot, envRoot, headSHA string, logger *slog.Logger) 
 			logger.Debug("execenv: snapshot index seeded from the repository index was unusable; rebuilding it",
 				"git_root", gitRoot, "output", strings.TrimSpace(out), "error", err)
 		}
-		if out, resetErr := runGitEnv(gitRoot, env, "read-tree", headSHA); resetErr != nil {
+		if out, resetErr := retryGitEnv(gitRoot, env, "read-tree", headSHA); resetErr != nil {
 			return "", fmt.Errorf("git read-tree: %s: %w", strings.TrimSpace(out), resetErr)
 		}
-		if out, retryErr := runGitEnv(gitRoot, env, addArgs...); retryErr != nil {
+		if out, retryErr := retryGitEnv(gitRoot, env, addArgs...); retryErr != nil {
 			return "", fmt.Errorf("git add: %s: %w", strings.TrimSpace(out), retryErr)
 		}
 	}
-	tree, err := runGitTrimmedEnv(gitRoot, env, "write-tree")
+	out, err := retryGitEnv(gitRoot, env, "write-tree")
 	if err != nil {
-		return "", fmt.Errorf("git write-tree: %w", err)
+		return "", fmt.Errorf("git write-tree: %s: %w", strings.TrimSpace(out), err)
 	}
+	tree := strings.TrimSpace(out)
 	// The identity args cover a repo with no user.email configured: writing a
 	// commit object needs a committer, and without them the user's uncommitted
 	// work would be dropped on a technicality.
 	args := append(commitIdentityArgs(gitRoot), "commit-tree", tree, "-p", headSHA, "-m",
 		"multica: local directory snapshot\n\nThe tree of this commit is the user's working directory as a task saw it.")
-	snapshot, err := runGitTrimmed(gitRoot, args...)
+	snapshot, err := retryGitTrimmed(gitRoot, args...)
 	if err != nil {
 		return "", fmt.Errorf("git commit-tree: %w", err)
 	}
@@ -1279,7 +1280,7 @@ func branchOwnedBy(gitRoot, branch string, owner branchOwner, logger *slog.Logge
 // git allows one worktree per branch, and refusing to run is worse than
 // delivering onto a task-scoped branch. It forks from the same base, so the
 // sibling still stands on the conversation's latest work.
-func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID string) (string, bool, error) {
+func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID string, logger *slog.Logger) (string, bool, error) {
 	var args []string
 	switch {
 	case plan.continues:
@@ -1291,7 +1292,14 @@ func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID 
 	default:
 		args = []string{"worktree", "add", "-b", plan.name, worktreePath, plan.base}
 	}
-	out, err := runGit(gitRoot, args...)
+	// Only the creating variants can leave a half-made ref behind; the others
+	// attach to or move an existing branch, which a retry simply repeats.
+	createsBranch := !plan.continues && !plan.reset
+	out, err := retryTransientGit(func() (string, error) {
+		return runGit(gitRoot, args...)
+	}, func() {
+		resetWorktreeAdd(gitRoot, worktreePath, plan.name, createsBranch, logger)
+	})
 	if err == nil {
 		return plan.name, !plan.continues, nil
 	}
@@ -1299,7 +1307,12 @@ func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID 
 		return "", false, fmt.Errorf("execenv: git worktree add: %s: %w", strings.TrimSpace(out), err)
 	}
 	alt := plan.altName(taskID)
-	if out, err := runGit(gitRoot, "worktree", "add", "-b", alt, worktreePath, plan.base); err != nil {
+	out, err = retryTransientGit(func() (string, error) {
+		return runGit(gitRoot, "worktree", "add", "-b", alt, worktreePath, plan.base)
+	}, func() {
+		resetWorktreeAdd(gitRoot, worktreePath, alt, true, logger)
+	})
+	if err != nil {
 		return "", false, fmt.Errorf("execenv: git worktree add: %s: %w", strings.TrimSpace(out), err)
 	}
 	return alt, true, nil
@@ -1362,12 +1375,19 @@ func replayUserState(worktreePath string, plan taskBranchPlan, snapshot string, 
 	// the entire point: it is not reachable any other way.
 	args := append(commitIdentityArgs(worktreePath), "commit-tree", snapshot+"^{tree}", "-p", carried,
 		"-m", "multica: local directory edits to replay")
-	increment, err := runGitTrimmed(worktreePath, args...)
+	increment, err := retryGitTrimmed(worktreePath, args...)
 	if err != nil || increment == "" {
 		return replayResult{}, fmt.Errorf("execenv: could not describe your local edits for replay into the task worktree: %w", err)
 	}
 
-	out, pickErr := runGit(worktreePath, "cherry-pick", "--no-commit", increment)
+	out, pickErr := retryTransientGit(func() (string, error) {
+		return runGit(worktreePath, "cherry-pick", "--no-commit", increment)
+	}, func() {
+		// A pick that died mid-merge can leave sequencer state or a
+		// half-applied tree; restore the branch tip so the retry starts
+		// from the same point as the first attempt.
+		abortCherryPick(worktreePath, logger)
+	})
 	if pickErr == nil {
 		return replayResult{}, nil
 	}
@@ -1471,8 +1491,9 @@ func unmergedPaths(worktreePath string) ([]string, error) {
 	return paths, nil
 }
 
-// abortCherryPick returns the worktree to the branch tip. Used only where the
-// conflict is not something the agent can act on; the ordinary conflict path
+// abortCherryPick returns the worktree to the branch tip. Used where the
+// cherry-pick must not be left behind — a failure the agent cannot act on, or
+// a transient failure about to be retried — while the ordinary conflict path
 // deliberately leaves the worktree as git left it.
 func abortCherryPick(worktreePath string, logger *slog.Logger) {
 	for _, args := range [][]string{{"cherry-pick", "--quit"}, {"reset", "--hard", "HEAD"}, {"clean", "-fdq"}} {
@@ -1735,4 +1756,119 @@ func withGitStderr(err error) error {
 		}
 	}
 	return err
+}
+
+// transientGitAttempts bounds how many times a git step re-asks the object
+// store for a byte it momentarily refused. With the doubling pause below the
+// default settings span ~15s: the virtiofs read storms observed in the field
+// outlast a 1s window, while a genuinely broken store still fails the task in
+// bounded time with the same error text as before this retry existed.
+const transientGitAttempts = 6
+
+// transientGitDelay is the pause before the second attempt; each following
+// pause doubles, spreading the attempts over the window. A var so tests run
+// without sleeping.
+var transientGitDelay = 500 * time.Millisecond
+
+// transientGitSleep is time.Sleep, behind a var so tests can assert the
+// backoff without waiting.
+var transientGitSleep = time.Sleep
+
+// transientObjectRead reports whether git's failure output describes the
+// object store failing to serve a byte rather than the operation itself being
+// wrong: a loose object momentarily unreadable, a blob not yet visible after
+// being written, an I/O error. The same command succeeds on the next attempt.
+// A genuine error — a conflict, a bad ref, real corruption — never matches
+// and is returned after the first attempt.
+func transientObjectRead(out string) bool {
+	lower := strings.ToLower(out)
+	for _, marker := range []string{
+		"unable to open loose object",
+		"unable to read",
+		"permission denied",
+		"input/output error",
+		"invalid object",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryTransientGit re-runs a git command while it fails with a transient
+// object-read signature. It pauses transientGitDelay before the second
+// attempt and doubles the pause before each later one, so a shared object
+// store that is stuck for several seconds gets a chance to recover. reset
+// runs before each retry for commands that can leave state behind (a
+// cherry-pick that died mid-merge) and is nil for stateless ones.
+//
+// The returned error is the last attempt's, so callers keep the error text
+// they see today. When a transient failure outlasts the whole window the
+// error is annotated with the attempt count: prepare runs in a killable
+// helper process whose stderr the parent discards, so the error text is the
+// only channel that reaches the task log, and the annotation is what tells
+// the operator the retry fired and the window was not long enough.
+func retryTransientGit(run func() (string, error), reset func()) (string, error) {
+	var out string
+	var err error
+	for attempt := 1; ; attempt++ {
+		out, err = run()
+		if err == nil {
+			return out, nil
+		}
+		if !transientObjectRead(out) {
+			// A genuine failure, not the object store: retrying cannot help.
+			return out, err
+		}
+		if attempt == transientGitAttempts {
+			return out, fmt.Errorf("%w: transient object-read failure persisted after %d attempts",
+				err, transientGitAttempts)
+		}
+		if reset != nil {
+			reset()
+		}
+		transientGitSleep(transientGitDelay << uint(attempt-1))
+	}
+}
+
+// retryGitEnv is runGitEnv with the transient retry, for the snapshot steps
+// that run against a private index.
+func retryGitEnv(dir string, extraEnv []string, args ...string) (string, error) {
+	return retryTransientGit(func() (string, error) {
+		return runGitEnv(dir, extraEnv, args...)
+	}, nil)
+}
+
+// retryGitTrimmed is runGitTrimmed with the transient retry. Like
+// runGitTrimmedEnv it folds git's failure output into the error, because on
+// this path stderr is not on the error at all — it is inside the combined
+// output.
+func retryGitTrimmed(dir string, args ...string) (string, error) {
+	out, err := retryGitEnv(dir, nil, args...)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", strings.TrimSpace(out), err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// resetWorktreeAdd undoes what a failed `worktree add` may have left behind so
+// the retry starts where the first attempt did: a partially checked-out
+// worktree and, when the variant creates the branch, the ref the checkout died
+// after making. A ref named branch can only be ours here: git runs its
+// branch-exists check before it reads the tree, so a ref that survives a
+// transient object failure is the one our own attempt made, still at base.
+//
+// Best effort by design: whatever it cannot clear, the retried add reports as
+// a plain non-transient failure.
+func resetWorktreeAdd(gitRoot, worktreePath, branch string, createsBranch bool, logger *slog.Logger) {
+	if err := removeLocalWorktreeDir(gitRoot, worktreePath, logger); err != nil {
+		if logger != nil {
+			logger.Warn("execenv: could not clear the worktree path after a failed add; the retry will report it",
+				"path", worktreePath, "error", err)
+		}
+	}
+	if createsBranch {
+		runGit(gitRoot, "branch", "-D", branch)
+	}
 }

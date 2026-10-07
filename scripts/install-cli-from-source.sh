@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
-# Build the multica CLI from this checkout and install it on macOS, instead of
-# the Homebrew tap or the GitHub release binaries.
+# Build the multica CLI (which includes the daemon) from this checkout, instead
+# of using the Homebrew tap or the GitHub release binaries. Runs on macOS and
+# Linux, including inside a Linux container that has the checkout.
 #
 # Usage:
 #   scripts/install-cli-from-source.sh [--bin-dir DIR]
+#   scripts/install-cli-from-source.sh --output FILE [--target OS/ARCH]
 #
 # Options:
-#   --bin-dir DIR   Install directory (default: $MULTICA_BIN_DIR or ~/.local/bin)
+#   --bin-dir DIR      Install directory (default: $MULTICA_BIN_DIR or ~/.local/bin)
+#   --output FILE      Only build, writing the binary to FILE; nothing is installed
+#   --target OS/ARCH   Cross-build with --output, e.g. linux/amd64 or linux/arm64
 #
-# Uses `go` from PATH when it is new enough to fetch the toolchain go.mod asks
-# for (Go 1.21+). Otherwise it downloads that exact Go release from go.dev into
-# ~/Library/Caches/multica-cli-source (checksum-verified), keeps its module and
-# build caches there too, and builds with it. Delete that directory to undo it.
+# Needs bash, git and tar, plus curl when no usable Go is on PATH (on Alpine:
+# apk add bash git curl). Uses `go` from PATH when it is new enough to fetch
+# the toolchain go.mod asks for (Go 1.21+). Otherwise it downloads that exact
+# Go release from go.dev into ~/Library/Caches/multica-cli-source on macOS or
+# ~/.cache/multica-cli-source on Linux (checksum-verified), keeps its module
+# and build caches there too, and builds with it. Delete that directory to undo.
 #
 # The binary is stamped with a `git describe --long` version such as
 # v0.6.1-2-gab586a87c. The daemon treats that shape as a source build and never
@@ -21,50 +27,92 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_DIR="$ROOT_DIR/server"
-CACHE_DIR="${MULTICA_SOURCE_CACHE_DIR:-$HOME/Library/Caches/multica-cli-source}"
 BIN_DIR="${MULTICA_BIN_DIR:-$HOME/.local/bin}"
+OUTPUT=""
+TARGET=""
 
 info() { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+need_value() { [ "$2" -ge 2 ] || fail "$1 needs a value"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --bin-dir)
-      [ $# -ge 2 ] || fail "--bin-dir needs a directory"
-      BIN_DIR="$2"
-      shift 2
-      ;;
+    --bin-dir) need_value "$1" $#; BIN_DIR="$2"; shift 2 ;;
     --bin-dir=*) BIN_DIR="${1#*=}"; shift ;;
+    --output) need_value "$1" $#; OUTPUT="$2"; shift 2 ;;
+    --output=*) OUTPUT="${1#*=}"; shift ;;
+    --target) need_value "$1" $#; TARGET="$2"; shift 2 ;;
+    --target=*) TARGET="${1#*=}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; fail "unknown option: $1" ;;
   esac
 done
 
-[ "$(uname -s)" = "Darwin" ] || fail "this script only supports macOS"
 [ -f "$SERVER_DIR/go.mod" ] || fail "$SERVER_DIR/go.mod not found; run this from a Multica checkout"
 
-# Build for the hardware, not the shell: under Rosetta `uname -m` says x86_64.
-if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then
-  GOARCH_HOST=arm64
-else
-  GOARCH_HOST=amd64
+case "$(uname -s)" in
+  Darwin)
+    HOST_OS=darwin
+    CACHE_DIR="${MULTICA_SOURCE_CACHE_DIR:-$HOME/Library/Caches/multica-cli-source}"
+    # Build for the hardware, not the shell: under Rosetta `uname -m` says x86_64.
+    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then
+      HOST_ARCH=arm64
+    else
+      HOST_ARCH=amd64
+    fi
+    ;;
+  Linux)
+    HOST_OS=linux
+    CACHE_DIR="${MULTICA_SOURCE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/multica-cli-source}"
+    case "$(uname -m)" in
+      x86_64|amd64) HOST_ARCH=amd64 ;;
+      aarch64|arm64) HOST_ARCH=arm64 ;;
+      *) fail "unsupported Linux architecture: $(uname -m)" ;;
+    esac
+    ;;
+  *) fail "unsupported OS: $(uname -s) (macOS and Linux only)" ;;
+esac
+
+TARGET_OS="$HOST_OS"
+TARGET_ARCH="$HOST_ARCH"
+if [ -n "$TARGET" ]; then
+  TARGET_OS="${TARGET%%/*}"
+  TARGET_ARCH="${TARGET#*/}"
+  case "$TARGET_OS/$TARGET_ARCH" in
+    darwin/amd64|darwin/arm64|linux/amd64|linux/arm64) ;;
+    *) fail "--target must be darwin/amd64, darwin/arm64, linux/amd64 or linux/arm64" ;;
+  esac
+fi
+if [ -z "$OUTPUT" ] && [ "$TARGET_OS/$TARGET_ARCH" != "$HOST_OS/$HOST_ARCH" ]; then
+  fail "--target $TARGET_OS/$TARGET_ARCH can't run here; add --output FILE to only build it"
 fi
 
-mkdir -p "$BIN_DIR"
-BIN_DIR="$(cd "$BIN_DIR" && pwd -P)"
+if [ -n "$OUTPUT" ]; then
+  case "$OUTPUT" in
+    */) fail "--output must be a file path, not a directory" ;;
+  esac
+  [ ! -d "$OUTPUT" ] || fail "--output $OUTPUT is a directory; pass a file path"
+  mkdir -p "$(dirname "$OUTPUT")"
+  DEST="$(cd "$(dirname "$OUTPUT")" && pwd -P)/$(basename "$OUTPUT")"
+else
+  mkdir -p "$BIN_DIR"
+  BIN_DIR="$(cd "$BIN_DIR" && pwd -P)"
+  DEST="$BIN_DIR/multica"
 
-# A binary under the Homebrew prefix is treated as a brew install, so
-# `multica update` would try `brew upgrade` on it.
-if command -v brew >/dev/null 2>&1; then
-  brew_prefix="$(brew --prefix 2>/dev/null || true)"
-  if [ -n "$brew_prefix" ]; then
-    brew_prefix="$(cd "$brew_prefix" 2>/dev/null && pwd -P || echo "$brew_prefix")"
-    case "$BIN_DIR/" in
-      "$brew_prefix"/*) fail "$BIN_DIR is inside the Homebrew prefix ($brew_prefix); choose another --bin-dir" ;;
-    esac
+  # A binary under the Homebrew prefix is treated as a brew install, so
+  # `multica update` would try `brew upgrade` on it.
+  if command -v brew >/dev/null 2>&1; then
+    brew_prefix="$(brew --prefix 2>/dev/null || true)"
+    if [ -n "$brew_prefix" ]; then
+      brew_prefix="$(cd "$brew_prefix" 2>/dev/null && pwd -P || echo "$brew_prefix")"
+      case "$BIN_DIR/" in
+        "$brew_prefix"/*) fail "$BIN_DIR is inside the Homebrew prefix ($brew_prefix); choose another --bin-dir" ;;
+      esac
+    fi
   fi
 fi
 
@@ -94,15 +142,24 @@ go_is_usable() {
   [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 21 ]; }
 }
 
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  else
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  fi
+}
+
 bootstrap_go() {
   local version="$1"
-  local root="$CACHE_DIR/go$version-darwin-$GOARCH_HOST"
+  local root="$CACHE_DIR/go$version-$HOST_OS-$HOST_ARCH"
   if [ -x "$root/go/bin/go" ]; then
     printf '%s\n' "$root/go/bin/go"
     return
   fi
 
-  local archive="go$version.darwin-$GOARCH_HOST.tar.gz"
+  command -v curl >/dev/null 2>&1 || fail "curl is needed to download Go (or put Go 1.21+ on PATH)"
+  local archive="go$version.$HOST_OS-$HOST_ARCH.tar.gz"
   local url="https://dl.google.com/go/$archive"
   # Runs inside $(...), so this EXIT trap only cleans up the download
   # subshell. Not local: the trap fires after the function has returned.
@@ -114,7 +171,7 @@ bootstrap_go() {
   curl -fsSL "$url.sha256" -o "$go_dl_tmp/sha256" || fail "failed to download $url.sha256"
   local expected actual
   expected="$(tr -d '[:space:]' <"$go_dl_tmp/sha256")"
-  actual="$(shasum -a 256 "$go_dl_tmp/$archive" | awk '{ print $1 }')"
+  actual="$(sha256_of "$go_dl_tmp/$archive")"
   [ -n "$expected" ] && [ "$expected" = "$actual" ] ||
     fail "checksum mismatch for $archive (expected $expected, got $actual)"
 
@@ -133,7 +190,7 @@ else
   command -v go >/dev/null 2>&1 && warn "$(command -v go) is older than Go 1.21; using a downloaded toolchain"
   GO_BIN="$(bootstrap_go "$(go_mod_version)")"
   # Keep the downloaded toolchain's module and build caches beside it rather
-  # than creating ~/go and ~/Library/Caches/go-build.
+  # than creating ~/go and the default Go build cache.
   export GOPATH="$CACHE_DIR/gopath" GOCACHE="$CACHE_DIR/go-build"
 fi
 
@@ -156,42 +213,50 @@ else
 fi
 DATE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-# --- Build and install ------------------------------------------------------
+# --- Build ------------------------------------------------------------------
 
-info "Building multica $VERSION (darwin/$GOARCH_HOST) with $("$GO_BIN" env GOVERSION)"
+info "Building multica $VERSION ($TARGET_OS/$TARGET_ARCH) with $("$GO_BIN" env GOVERSION)"
 
-# Build next to the destination and rename into place: replacing a running
-# binary by rewriting it in place gets it killed by macOS code signing checks.
-tmp_bin="$(mktemp "$BIN_DIR/.multica.XXXXXX")"
+# Build next to the destination and rename into place. Rewriting a running
+# binary in place fails on Linux (text file busy) and gets it killed by macOS
+# code signing checks; a rename leaves the running copy untouched.
+tmp_bin="$(mktemp "$(dirname "$DEST")/.multica.XXXXXX")"
 trap 'rm -f "$tmp_bin"' EXIT
 
 (
   cd "$SERVER_DIR"
-  CGO_ENABLED=0 GOOS=darwin GOARCH="$GOARCH_HOST" "$GO_BIN" build \
+  CGO_ENABLED=0 GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" "$GO_BIN" build \
     -trimpath \
     -ldflags "-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.date=$DATE" \
     -o "$tmp_bin" ./cmd/multica
 )
 chmod 755 "$tmp_bin"
-"$tmp_bin" version >/dev/null || fail "built binary failed to run"
-mv -f "$tmp_bin" "$BIN_DIR/multica"
+if [ "$TARGET_OS/$TARGET_ARCH" = "$HOST_OS/$HOST_ARCH" ]; then
+  "$tmp_bin" version >/dev/null || fail "built binary failed to run"
+fi
+mv -f "$tmp_bin" "$DEST"
 trap - EXIT
 
-info "Installed $BIN_DIR/multica"
-"$BIN_DIR/multica" version
+if [ -n "$OUTPUT" ]; then
+  info "Built $DEST ($TARGET_OS/$TARGET_ARCH, $VERSION)"
+  exit 0
+fi
+
+info "Installed $DEST"
+"$DEST" version
 
 # --- PATH checks ------------------------------------------------------------
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *)
-    warn "$BIN_DIR is not on PATH. Add it, e.g. in ~/.zshrc:"
+    warn "$BIN_DIR is not on PATH. Add this to your shell profile:"
     printf '    export PATH="%s:$PATH"\n' "$BIN_DIR" >&2
     ;;
 esac
 
 resolved="$(command -v multica 2>/dev/null || true)"
-if [ -n "$resolved" ] && [ "$(cd "$(dirname "$resolved")" && pwd -P)/multica" != "$BIN_DIR/multica" ]; then
+if [ -n "$resolved" ] && [ "$(cd "$(dirname "$resolved")" && pwd -P)/multica" != "$DEST" ]; then
   warn "'multica' on PATH resolves to $resolved, not this build."
   if command -v brew >/dev/null 2>&1 && brew list multica >/dev/null 2>&1; then
     warn "Remove the Homebrew copy with: brew uninstall multica"

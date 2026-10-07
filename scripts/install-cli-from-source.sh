@@ -12,12 +12,10 @@
 #   --output FILE      Only build, writing the binary to FILE; nothing is installed
 #   --target OS/ARCH   Cross-build with --output, e.g. linux/amd64 or linux/arm64
 #
-# Needs bash, git and tar, plus curl when no usable Go is on PATH (on Alpine:
-# apk add bash git curl). Uses `go` from PATH when it is new enough to fetch
-# the toolchain go.mod asks for (Go 1.21+). Otherwise it downloads that exact
-# Go release from go.dev into ~/Library/Caches/multica-cli-source on macOS or
-# ~/.cache/multica-cli-source on Linux (checksum-verified), keeps its module
-# and build caches there too, and builds with it. Delete that directory to undo.
+# Needs bash, git and Go 1.21 or newer, taken from PATH or
+# /usr/local/go/bin/go (on Alpine: apk add bash git). The script itself makes
+# no network requests; `go build` fetches modules, and a newer toolchain if
+# server/go.mod asks for one, through Go's own module proxy settings.
 #
 # The binary is stamped with a `git describe --long` version such as
 # v0.6.1-2-gab586a87c. The daemon treats that shape as a source build and never
@@ -57,7 +55,6 @@ done
 case "$(uname -s)" in
   Darwin)
     HOST_OS=darwin
-    CACHE_DIR="${MULTICA_SOURCE_CACHE_DIR:-$HOME/Library/Caches/multica-cli-source}"
     # Build for the hardware, not the shell: under Rosetta `uname -m` says x86_64.
     if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then
       HOST_ARCH=arm64
@@ -67,7 +64,6 @@ case "$(uname -s)" in
     ;;
   Linux)
     HOST_OS=linux
-    CACHE_DIR="${MULTICA_SOURCE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/multica-cli-source}"
     case "$(uname -m)" in
       x86_64|amd64) HOST_ARCH=amd64 ;;
       aarch64|arm64) HOST_ARCH=arm64 ;;
@@ -118,18 +114,6 @@ fi
 
 # --- Go toolchain -----------------------------------------------------------
 
-go_mod_version() {
-  local v
-  v="$(awk '$1 == "go" { print $2; exit }' "$SERVER_DIR/go.mod")"
-  [ -n "$v" ] || fail "could not read the go version from server/go.mod"
-  # Go 1.21+ release archives always carry a patch number (go1.26.0).
-  case "$v" in
-    *.*.*) ;;
-    *) v="$v.0" ;;
-  esac
-  printf '%s\n' "$v"
-}
-
 # True when this go can switch to the toolchain go.mod requires (Go 1.21+).
 go_is_usable() {
   local v major minor
@@ -142,57 +126,10 @@ go_is_usable() {
   [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 21 ]; }
 }
 
-sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{ print $1 }'
-  else
-    shasum -a 256 "$1" | awk '{ print $1 }'
-  fi
-}
-
-bootstrap_go() {
-  local version="$1"
-  local root="$CACHE_DIR/go$version-$HOST_OS-$HOST_ARCH"
-  if [ -x "$root/go/bin/go" ]; then
-    printf '%s\n' "$root/go/bin/go"
-    return
-  fi
-
-  command -v curl >/dev/null 2>&1 || fail "curl is needed to download Go (or put Go 1.21+ on PATH)"
-  local archive="go$version.$HOST_OS-$HOST_ARCH.tar.gz"
-  local url="https://dl.google.com/go/$archive"
-  # Runs inside $(...), so this EXIT trap only cleans up the download
-  # subshell. Not local: the trap fires after the function has returned.
-  go_dl_tmp="$(mktemp -d)"
-  trap 'rm -rf "$go_dl_tmp"' EXIT
-
-  info "Go not found on PATH; downloading Go $version for building" >&2
-  curl -fsSL "$url" -o "$go_dl_tmp/$archive" || fail "failed to download $url"
-  curl -fsSL "$url.sha256" -o "$go_dl_tmp/sha256" || fail "failed to download $url.sha256"
-  local expected actual
-  expected="$(tr -d '[:space:]' <"$go_dl_tmp/sha256")"
-  actual="$(sha256_of "$go_dl_tmp/$archive")"
-  [ -n "$expected" ] && [ "$expected" = "$actual" ] ||
-    fail "checksum mismatch for $archive (expected $expected, got $actual)"
-
-  mkdir -p "$go_dl_tmp/extract"
-  tar -xzf "$go_dl_tmp/$archive" -C "$go_dl_tmp/extract"
-  mkdir -p "$CACHE_DIR"
-  rm -rf "$root"
-  mv "$go_dl_tmp/extract" "$root"
-  printf '%s\n' "$root/go/bin/go"
-}
-
-GO_BIN=""
-if command -v go >/dev/null 2>&1 && go_is_usable "$(command -v go)"; then
-  GO_BIN="$(command -v go)"
-else
-  command -v go >/dev/null 2>&1 && warn "$(command -v go) is older than Go 1.21; using a downloaded toolchain"
-  GO_BIN="$(bootstrap_go "$(go_mod_version)")"
-  # Keep the downloaded toolchain's module and build caches beside it rather
-  # than creating ~/go and the default Go build cache.
-  export GOPATH="$CACHE_DIR/gopath" GOCACHE="$CACHE_DIR/go-build"
-fi
+GO_BIN="$(command -v go 2>/dev/null || true)"
+[ -n "$GO_BIN" ] || GO_BIN=/usr/local/go/bin/go
+[ -x "$GO_BIN" ] || fail "Go not found on PATH or at /usr/local/go/bin/go; install Go 1.21+ first"
+go_is_usable "$GO_BIN" || fail "$GO_BIN is older than Go 1.21; install a newer Go"
 
 # --- Version stamp ----------------------------------------------------------
 
